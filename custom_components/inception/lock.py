@@ -12,6 +12,7 @@ import voluptuous as vol
 from homeassistant.components.lock import (
     LockEntity,
     LockEntityDescription,
+    LockEntityFeature,
 )
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_platform
@@ -88,6 +89,7 @@ class InceptionLock(InceptionEntity, LockEntity):
     data: DoorSummaryEntry
 
     _attr_has_entity_name = True
+    _attr_supported_features = LockEntityFeature.OPEN
     _device_id: str
 
     _unlock_strategy_initialized: bool = False
@@ -243,6 +245,16 @@ class InceptionLock(InceptionEntity, LockEntity):
             return await self.unlock_service(time_secs=duration)
 
         return await self.unlock_service()
+
+    async def async_open(self, **_kwargs: Any) -> None:
+        """Grant access: momentary unlock using the door's configured unlock time."""
+        _LOGGER.debug("Granting access (open) to door")
+        return await self._door_control(
+            data={
+                "Type": "ControlDoor",
+                "DoorControlType": DoorControlType.OPEN,
+            },
+        )
 
     async def unlock_service(self, time_secs: int | None = None) -> None:
         """Unlock the device. If a time is provided, the device will issue a timed unlock."""
