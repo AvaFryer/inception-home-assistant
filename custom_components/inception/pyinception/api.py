@@ -53,6 +53,12 @@ class InceptionApiClientAuthenticationError(
     """Exception to indicate an authentication error."""
 
 
+class InceptionApiClientForbiddenError(
+    InceptionApiClientAuthenticationError,
+):
+    """403: credentials are valid but lack permission for this resource."""
+
+
 def _session_cookie(session_id: str | None) -> dict[str, str] | None:
     """Return the login session cookie, or None in token mode."""
     return {"LoginSessId": session_id} if session_id else None
@@ -99,6 +105,9 @@ class InceptionApiClient:
         self._host = host.rstrip("/")
         self._session = session
         self.data: InceptionApiData | None = None
+        # Item types ("doors", "outputs", ...) the user has no permission to
+        # read. They are treated as empty and left out of the long-poll.
+        self.skipped_types: set[str] = set()
         self.data_update_cbs: list = []
         self.review_event_cbs: list = []
         self.auth_error_cbs: list = []
@@ -215,12 +224,38 @@ class InceptionApiClient:
     async def get_data(self) -> InceptionApiData:
         """Get the status of the API."""
         if self.data is None:
-            doors, outputs, inputs, areas = await asyncio.gather(
+            results = await asyncio.gather(
                 self.get_controls(DoorSummary),
                 self.get_controls(OutputSummary),
                 self.get_controls(InputSummary),
                 self.get_controls(AreaSummary),
+                return_exceptions=True,
             )
+            names = ("doors", "outputs", "inputs", "areas")
+            empties = (
+                lambda: DoorSummary(Doors={}),
+                lambda: OutputSummary(Outputs={}),
+                lambda: InputSummary(Inputs={}),
+                lambda: AreaSummary(Areas={}),
+            )
+            resolved = []
+            for name, result, empty in zip(names, results, empties, strict=True):
+                if isinstance(result, InceptionApiClientForbiddenError):
+                    _LOGGER.warning(
+                        "No permission to read %s (HTTP 403); skipping them. "
+                        "Grant the user permission in Inception to include them.",
+                        name,
+                    )
+                    self.skipped_types.add(name)
+                    resolved.append(empty())
+                elif isinstance(result, BaseException):
+                    raise result
+                else:
+                    resolved.append(result)
+            if len(self.skipped_types) == len(names):
+                msg = "User has no permission to read any Inception items"
+                raise InceptionApiClientAuthenticationError(msg)
+            doors, outputs, inputs, areas = resolved
 
             self.data = InceptionApiData(
                 inputs=inputs,
@@ -262,6 +297,7 @@ class InceptionApiClient:
                 ("OutputStateRequest", "OutputState", OutputPublicState, "outputs"),
                 ("AreaStateRequest", "AreaState", AreaPublicState, "areas"),
             ]
+            if api_data not in self.skipped_types
         }
 
         payload = [
@@ -772,6 +808,9 @@ class InceptionApiClient:
                 json=data,
                 timeout=api_timeout or aiohttp.ClientTimeout(total=10),
             )
+            if response.status == 403:  # noqa: PLR2004
+                msg = "Invalid credentials (forbidden)"
+                raise InceptionApiClientForbiddenError(msg)  # noqa: TRY301
             if response.status in (401, 403):
                 # Surface 401/403 as a specific auth error so the coordinator
                 # can route it into Home Assistant's re-auth flow rather than
