@@ -1,0 +1,1002 @@
+"""Inception API Client."""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import contextlib
+import hashlib
+import logging
+import socket
+from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
+from urllib.parse import urlencode
+
+import aiohttp
+
+from .data import InceptionApiData
+from .schemas.area import AreaPublicState, AreaSummary
+from .schemas.door import DoorPublicState, DoorSummary
+from .schemas.input import InputPublicState, InputSummary
+from .schemas.output import OutputPublicState, OutputSummary
+from .schemas.review_events import LiveReviewEventsRequest
+from .schemas.system_info import SystemInfo
+from .schemas.update_monitor import (
+    MonitorEntityStatesRequest,
+    UpdateMonitorResponse,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .schemas.entities import (
+        InceptionSummary,
+    )
+
+_LOGGER = logging.getLogger(__name__)
+
+_NIL_SESSION_ID = "00000000-0000-0000-0000-000000000000"
+
+
+class InceptionApiClientError(Exception):
+    """Exception to indicate a general API error."""
+
+
+class InceptionApiClientCommunicationError(
+    InceptionApiClientError,
+):
+    """Exception to indicate a communication error."""
+
+
+class InceptionApiClientAuthenticationError(
+    InceptionApiClientError,
+):
+    """Exception to indicate an authentication error."""
+
+
+class InceptionApiClientForbiddenError(
+    InceptionApiClientAuthenticationError,
+):
+    """403: credentials are valid but lack permission for this resource."""
+
+
+def _session_cookie(session_id: str | None) -> dict[str, str] | None:
+    """Return the login session cookie, or None in token mode."""
+    return {"LoginSessId": session_id} if session_id else None
+
+
+class InceptionApiClient:
+    """Inception API Client."""
+
+    _monitor_update_times: ClassVar[dict[str, int]] = {}
+    _review_events_update_time: ClassVar[int] = 0
+    _review_events_reference_id: ClassVar[str | None] = None
+
+    def __init__(
+        self,
+        token: str | None,
+        host: str,
+        session: aiohttp.ClientSession,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
+        """
+        Inception API Client.
+
+        Authenticates with ``token`` (``Authorization: APIToken``) when given.
+        Otherwise logs in with ``username``/``password`` and sends the
+        resulting session ID as the ``LoginSessId`` cookie. Older firmware
+        has no API tokens, so password login is the only option there.
+        """
+        if not token and not (username and password):
+            msg = "Either a token or a username and password is required"
+            raise ValueError(msg)
+        self._token = token
+        self._username = username
+        self._password = password
+        self._session_id: str | None = None
+        self._login_lock = asyncio.Lock()
+        # Set once a login is rejected, so later requests fail fast instead of
+        # each retrying the same bad password and tripping the panel lockout.
+        self._login_error: str | None = None
+        # Hashed login keeps the password off the wire; cleared if the
+        # firmware lacks the endpoint, so later logins go straight to plain.
+        self._hashed_login = True
+        self._closed = False
+        self._host = host.rstrip("/")
+        self._session = session
+        self.data: InceptionApiData | None = None
+        # Item types ("doors", "outputs", ...) the user has no permission to
+        # read. They are treated as empty and left out of the long-poll.
+        self.skipped_types: set[str] = set()
+        self.data_update_cbs: list = []
+        self.review_event_cbs: list = []
+        self.auth_error_cbs: list = []
+        self.loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        self.rest_task: asyncio.Task | None = None
+        self._last_update: int | None = None
+        self._review_events_enabled: bool = False
+        self._review_events_categories: list[str] = []
+        self._rest_task_retry_count: int = 0
+        self._rest_task_max_retry_delay: int = 300  # 5 minutes max
+        self.protocol_version: int | None = None
+        self.system_info: SystemInfo | None = None
+
+    T = TypeVar("T", DoorSummary, InputSummary, OutputSummary, AreaSummary)
+
+    async def get_controls(self, Type: type[T]) -> T:  # noqa: N803
+        """Get control item summaries."""
+        path_map = {
+            DoorSummary: "door",
+            InputSummary: "input",
+            OutputSummary: "output",
+            AreaSummary: "area",
+        }
+        if Type not in path_map:
+            msg = f"Unsupported entity type: {Type}"
+            raise ValueError(msg)
+
+        data = await self.request(
+            method="get",
+            path=f"/control/{path_map[Type]}/summary",
+        )
+        return Type(**data)
+
+    async def authenticate(self) -> bool:
+        """Authenticate with the API."""
+        await self.request(
+            method="get",
+            path="/control/input",
+        )
+        return True
+
+    async def get_protocol_version(self) -> int | None:
+        """
+        Fetch the Inception API protocol version.
+
+        Returns the `ProtocolVersion` integer reported by the controller, or
+        `None` if the endpoint returns 404 (firmware too old to expose it).
+        Authentication is not required by the API for this endpoint, so none
+        is sent; in password mode this avoids a login just for the probe.
+        """
+        try:
+            response = await self.request(
+                method="get",
+                path="/protocol-version",
+                api_prefix="api",
+                authenticated=False,
+            )
+        except InceptionApiClientCommunicationError as err:
+            if "404" in str(err):
+                _LOGGER.warning(
+                    "Inception firmware does not expose /api/protocol-version; "
+                    "the firmware is likely older than v4.0"
+                )
+                self.protocol_version = None
+                return None
+            raise
+
+        if not isinstance(response, dict):
+            return None
+
+        version = response.get("ProtocolVersion")
+        if isinstance(version, int):
+            self.protocol_version = version
+            _LOGGER.info("Inception API protocol version: %d", version)
+            return version
+        return None
+
+    async def get_system_info(self) -> SystemInfo | None:
+        """
+        Fetch the controller's SystemInfoDto from `/api/v1/system-info`.
+
+        Exposes `SerialNumber` and `SystemName`, used to populate the panel
+        device metadata shown in the Home Assistant device registry.
+        """
+        try:
+            response = await self.request(
+                method="get",
+                path="/system-info",
+            )
+        except InceptionApiClientCommunicationError as err:
+            if "404" in str(err):
+                _LOGGER.debug("Inception firmware does not expose /system-info")
+                self.system_info = None
+                return None
+            raise
+
+        if not isinstance(response, dict):
+            return None
+
+        info = SystemInfo(**response)
+        self.system_info = info
+        _LOGGER.info(
+            "Inception system info: name=%s serial=%s",
+            info.system_name,
+            info.serial_number,
+        )
+        return info
+
+    async def connect(self) -> None:
+        """Connect to the API."""
+        self._schedule_data_callbacks()
+        self.rest_task = asyncio.create_task(self._rest_task())
+
+    async def get_data(self) -> InceptionApiData:
+        """Get the status of the API."""
+        if self.data is None:
+            results = await asyncio.gather(
+                self.get_controls(DoorSummary),
+                self.get_controls(OutputSummary),
+                self.get_controls(InputSummary),
+                self.get_controls(AreaSummary),
+                return_exceptions=True,
+            )
+            names = ("doors", "outputs", "inputs", "areas")
+            empties = (
+                lambda: DoorSummary(Doors={}),
+                lambda: OutputSummary(Outputs={}),
+                lambda: InputSummary(Inputs={}),
+                lambda: AreaSummary(Areas={}),
+            )
+            resolved = []
+            for name, result, empty in zip(names, results, empties, strict=True):
+                if isinstance(result, InceptionApiClientForbiddenError):
+                    _LOGGER.warning(
+                        "No permission to read %s (HTTP 403); skipping them. "
+                        "Grant the user permission in Inception to include them.",
+                        name,
+                    )
+                    self.skipped_types.add(name)
+                    resolved.append(empty())
+                elif isinstance(result, BaseException):
+                    raise result
+                else:
+                    resolved.append(result)
+            if len(self.skipped_types) == len(names):
+                msg = "User has no permission to read any Inception items"
+                raise InceptionApiClientAuthenticationError(msg)
+            doors, outputs, inputs, areas = resolved
+
+            self.data = InceptionApiData(
+                inputs=inputs,
+                doors=doors,
+                areas=areas,
+                outputs=outputs,
+            )
+
+        return self.data
+
+    REVIEW_EVENTS_REQUEST_ID: ClassVar[str] = "LiveReviewEventsRequest"
+
+    async def monitor_entity_states(self) -> None:
+        """
+        Run a single long-poll iteration against `/monitor-updates`.
+
+        The payload bundles state-change sub-requests for all four entity
+        types (Input, Door, Output, Area), plus the LiveReviewEvents
+        sub-request when review events are enabled. The server returns a
+        response for exactly one sub-request per call (matched by `ID`),
+        so the dispatch here simply routes on the response `ID`.
+        """
+        _LOGGER.debug("Starting long-poll monitor")
+        if self.data is None:
+            _LOGGER.warning("state monitor: no data to update")
+            return
+
+        request_types = {
+            request_id: MonitorEntityStatesRequest(
+                request_id=request_id,
+                state_type=state_type,
+                public_state_type=public_state_type,
+                time_since_last_update=self._monitor_update_times.get(request_id, 0),
+                api_data=api_data,
+            )
+            for request_id, state_type, public_state_type, api_data in [
+                ("InputStateRequest", "InputState", InputPublicState, "inputs"),
+                ("DoorStateRequest", "DoorState", DoorPublicState, "doors"),
+                ("OutputStateRequest", "OutputState", OutputPublicState, "outputs"),
+                ("AreaStateRequest", "AreaState", AreaPublicState, "areas"),
+            ]
+            if api_data not in self.skipped_types
+        }
+
+        payload = [
+            request_type.get_request_payload()
+            for request_type in request_types.values()
+        ]
+
+        review_request = await self._build_review_events_subrequest()
+        if review_request is not None:
+            payload.append(review_request.get_request_payload())
+
+        response = await self._monitor_events_request(payload)
+
+        if not response:
+            # No response from the API, try again later
+            return
+
+        response_id = response["ID"]
+
+        if response_id == self.REVIEW_EVENTS_REQUEST_ID and self._review_events_enabled:
+            self._handle_review_events_response(response)
+            return
+
+        update_request = request_types.get(response_id)
+        if update_request is None:
+            _LOGGER.error("Unknown response ID: %s", response_id)
+            return
+
+        self._handle_entity_state_response(response, update_request)
+
+    def _handle_entity_state_response(
+        self,
+        response: dict[str, Any],
+        update_request: MonitorEntityStatesRequest,
+    ) -> None:
+        """Apply a MonitorEntityStates sub-request response to cached data."""
+        result_response = UpdateMonitorResponse[update_request.public_state_type](
+            **response["Result"]
+        )
+
+        self._monitor_update_times[update_request.request_id] = (
+            result_response.update_time
+        )
+
+        if self.data is None:
+            return
+        entity_data: InceptionSummary = getattr(self.data, update_request.api_data)
+        if entity_data is None:
+            _LOGGER.error("No entity data for %s", update_request.api_data)
+            return
+
+        for event in result_response.state_data:
+            try:
+                if event.id not in entity_data.items:
+                    _LOGGER.warning(
+                        "Item %s not found in entity data, perhaps it was added recently? Please reload the integration.",  # noqa: E501
+                        event.id,
+                    )
+                    continue
+
+                _LOGGER.debug(
+                    "Event: %s, %s, %s",
+                    entity_data.items[event.id].entity_info.name,
+                    event.public_state,
+                    event.extra_fields,
+                )
+
+                entity_data.items[event.id].public_state = event.public_state
+                entity_data.items[event.id].extra_fields.update(event.extra_fields)
+            except Exception:
+                _LOGGER.exception("Error processing event")
+
+    def _handle_review_events_response(self, response: dict[str, Any]) -> None:
+        """Route a LiveReviewEvents sub-request response to the processor."""
+        result = response.get("Result", [])
+        if isinstance(result, list) and result:
+            self._process_review_events_data(result)
+
+    async def _build_review_events_subrequest(
+        self,
+    ) -> LiveReviewEventsRequest | None:
+        """
+        Construct the LiveReviewEvents sub-request payload if enabled.
+
+        On first use it establishes the reference point via
+        `_get_latest_review_event`; if that fails we skip adding the
+        sub-request this iteration rather than crashing the whole bundle.
+        """
+        if not self._review_events_enabled:
+            return None
+
+        if not self._review_events_reference_id:
+            latest = await self._get_latest_review_event()
+            if latest is None:
+                _LOGGER.warning(
+                    "Failed to establish review events reference point; "
+                    "skipping review events this iteration"
+                )
+                return None
+            InceptionApiClient._review_events_update_time = latest.get("WhenTicks", 0)
+            InceptionApiClient._review_events_reference_id = latest.get("ID")
+            _LOGGER.info(
+                "Established review events reference point: ID=%s, Time=%d",
+                self._review_events_reference_id,
+                self._review_events_update_time,
+            )
+
+        return LiveReviewEventsRequest(
+            request_id=self.REVIEW_EVENTS_REQUEST_ID,
+            reference_id=self._review_events_reference_id,
+            reference_time=self._review_events_update_time,
+            category_filter=self._review_events_categories or None,
+        )
+
+    async def _get_latest_review_event(self) -> dict[str, Any] | None:
+        """Get the latest review event to establish reference point."""
+        try:
+            params = {"dir": "desc", "limit": 1}
+            query_params = urlencode(params)
+            response = await self._review_events_request(query_params)
+
+            if not response:
+                return None
+
+            # The response should be a list of events
+            if isinstance(response, list) and response:
+                return response[0]
+
+            if isinstance(response, dict) and "Data" in response:
+                data = response["Data"]
+                if isinstance(data, list) and data:
+                    return data[0]
+
+            return None  # noqa: TRY300
+        except Exception:
+            _LOGGER.exception("Error getting latest review event")
+            return None
+
+    def _process_review_events_data(self, events_data: Any) -> None:
+        """Process review events data and trigger callbacks."""
+        # Check if we have a list of events or need to extract them
+        events = events_data if isinstance(events_data, list) else [events_data]
+
+        # Find the latest event time to use as reference for next request
+        latest_time = 0
+        is_initial_load = self._review_events_update_time == 0
+
+        for event_data in events:
+            # Handle both dict and string responses
+            if not isinstance(event_data, dict):
+                _LOGGER.warning("Unexpected review Event: %s", event_data)
+                continue
+
+            _LOGGER.debug("Review Event: %s", event_data)
+
+            # Update reference time and ID
+            event_ref_time = event_data.get("WhenTicks", 0)
+            event_id = event_data.get("ID")
+
+            if not event_id:
+                continue
+
+            if event_ref_time > latest_time:
+                latest_time = event_ref_time
+                # Store the reference ID for the latest event
+                InceptionApiClient._review_events_reference_id = event_id
+
+            # Only trigger callbacks for new events (not during initial load)
+            if not is_initial_load:
+                # Trigger review event callbacks for new events only
+                for cb in self.review_event_cbs:
+                    self._schedule_review_event_callback(cb, event_data)
+
+        # Update the reference time for next request
+        if latest_time > self._review_events_update_time:
+            InceptionApiClient._review_events_update_time = latest_time
+
+        # Log the initial load behavior
+        if is_initial_load:
+            _LOGGER.info(
+                "Initial review events load completed. Found %d historical event(s), "
+                "reference time set to %d. Future events will be emitted to HA.",
+                len(events),
+                latest_time,
+            )
+
+    def _schedule_data_callback(self, cb: Callable) -> None:
+        """Schedule a data callback."""
+        self.loop.call_soon_threadsafe(cb, self.data)
+
+    def _schedule_review_event_callback(self, cb: Callable, event: dict) -> None:
+        """Schedule a review event callback."""
+        self.loop.call_soon_threadsafe(cb, event)
+
+    def _schedule_data_callbacks(self) -> None:
+        """Schedule a data callbacks."""
+        for cb in self.data_update_cbs:
+            self._schedule_data_callback(cb)
+
+    def register_data_callback(self, callback: Callable) -> None:
+        """Register a data update callback."""
+        if callback not in self.data_update_cbs:
+            self.data_update_cbs.append(callback)
+
+    def register_review_event_callback(self, callback: Callable) -> None:
+        """Register a review event callback."""
+        if callback not in self.review_event_cbs:
+            self.review_event_cbs.append(callback)
+
+    def register_auth_error_callback(self, callback: Callable) -> None:
+        """Register a callback invoked when the controller rejects auth."""
+        if callback not in self.auth_error_cbs:
+            self.auth_error_cbs.append(callback)
+
+    def _schedule_auth_error_callbacks(self) -> None:
+        """Fan out auth-error notifications on the main loop."""
+        for cb in self.auth_error_cbs:
+            self.loop.call_soon_threadsafe(cb)
+
+    async def _rest_task(self) -> None:
+        """Poll data periodically via Rest."""
+        while True:
+            try:
+                await self.monitor_entity_states()
+                self._reset_retry_count("rest_task")
+            except InceptionApiClientAuthenticationError:
+                _LOGGER.exception(
+                    "rest_task: Authentication error, stopping monitoring"
+                )
+                self._schedule_auth_error_callbacks()
+                break
+            except (
+                InceptionApiClientCommunicationError,
+                InceptionApiClientError,
+                TimeoutError,
+            ) as err:
+                _LOGGER.warning("rest_task: Connection error: %s", err)
+                delay = self._increment_retry_count("rest_task")
+                await asyncio.sleep(delay)
+            except Exception:
+                _LOGGER.exception("rest_task: Unexpected error in monitoring")
+                delay = self._increment_retry_count("rest_task")
+                await asyncio.sleep(delay)
+            self._schedule_data_callbacks()
+
+    @staticmethod
+    def _get_retry_delay(retry_count: int, max_delay: int = 300) -> int:
+        """Calculate exponential backoff delay for retries."""
+        if retry_count == 0:
+            return 5  # First retry after 5 seconds
+
+        # Exponential backoff: 5, 10, 20, 40, 80, 160, 300 (capped)
+        return min(
+            5 * (2 ** (retry_count - 1)),
+            max_delay,
+        )
+
+    def _reset_retry_count(self, task_name: str) -> None:
+        """Reset retry count after successful operation."""
+        count_attr = f"_{task_name}_retry_count"
+        if getattr(self, count_attr) > 0:
+            _LOGGER.debug("%s: Connection recovered, resetting retry count", task_name)
+            setattr(self, count_attr, 0)
+
+    def _increment_retry_count(self, task_name: str) -> int:
+        """Increment retry count, log the backoff strategy, and return the delay."""
+        count_attr = f"_{task_name}_retry_count"
+        max_attr = f"_{task_name}_max_retry_delay"
+        count = getattr(self, count_attr) + 1
+        setattr(self, count_attr, count)
+        delay = self._get_retry_delay(count, getattr(self, max_attr))
+        _LOGGER.warning(
+            "%s: error #%d, retrying in %d seconds",
+            task_name,
+            count,
+            delay,
+        )
+        return delay
+
+    async def _ensure_session(self, stale: str | None = None) -> str:
+        """
+        Return a valid login session ID, logging in if needed.
+
+        Pass ``stale`` to replace a session the server rejected; it is logged
+        out first so the panel does not keep it open. The lock stops
+        concurrent requests (e.g. the long-poll and a door command) from each
+        logging in when the same session expires.
+        """
+        if stale is None and self._session_id is not None:
+            return self._session_id
+        async with self._login_lock:
+            if self._closed:
+                msg = "Client is closed"
+                raise InceptionApiClientError(msg)
+            if self._login_error is not None:
+                raise InceptionApiClientAuthenticationError(self._login_error)
+            if self._session_id is not None and self._session_id == stale:
+                self._session_id = None
+                await self._logout(stale)
+            if self._session_id is None:
+                try:
+                    self._session_id = await self._login()
+                except InceptionApiClientAuthenticationError as err:
+                    self._login_error = str(err)
+                    raise
+            return self._session_id
+
+    async def _login(self) -> str:
+        """Log in with username/password and return the new session ID."""
+        _LOGGER.debug("Logging in to Inception as %s", self._username)
+        body = None
+        if self._hashed_login:
+            try:
+                body = await self._send(
+                    "post",
+                    f"{self._host}/api/v1/authentication/hashed-login",
+                    data={
+                        "Username": self._username,
+                        "PasswordHash": self._password_hash(),
+                    },
+                )
+            except InceptionApiClientCommunicationError as err:
+                cause = err.__cause__
+                if not (
+                    isinstance(cause, aiohttp.ClientResponseError)
+                    and cause.status in (404, 405)
+                ):
+                    raise
+                _LOGGER.debug("No hashed-login endpoint; using plain login")
+                self._hashed_login = False
+        if not self._hashed_login:
+            body = await self._send(
+                "post",
+                f"{self._host}/api/v1/authentication/login",
+                data={"Username": self._username, "Password": self._password},
+            )
+        if not isinstance(body, dict):
+            body = {}
+        session_id = body.get("UserID")
+        result = body.get("Response")
+        if not isinstance(result, dict):
+            result = {}
+        # A failed login can still return HTTP 200 with a nil UserID
+        # ("00000000-...") alongside Result "Failure", so check both.
+        failed = result.get("Result", "Success") != "Success"
+        if failed or not session_id or session_id == _NIL_SESSION_ID:
+            message = result.get("Message")
+            msg = f"Login failed: {message or 'no session returned'}"
+            raise InceptionApiClientAuthenticationError(msg)
+        return session_id
+
+    def _password_hash(self) -> str:
+        """Return base64(sha256(lower(username) + ":" + password))."""
+        text = f"{(self._username or '').lower()}:{self._password}"
+        return base64.b64encode(hashlib.sha256(text.encode()).digest()).decode()
+
+    async def _logout(self, session_id: str) -> None:
+        """Best-effort logout so the panel can drop the session immediately."""
+        with contextlib.suppress(Exception):
+            await self._send(
+                "post",
+                f"{self._host}/api/v1/authentication/logout",
+                cookies=_session_cookie(session_id),
+                api_timeout=aiohttp.ClientTimeout(total=5),
+            )
+
+    async def close(self) -> None:
+        """Close the session."""
+        _LOGGER.debug("Closing session")
+        self._closed = True
+
+        # Disable review-event bundling so a partial restart doesn't inherit it.
+        self._review_events_enabled = False
+        self._review_events_categories = []
+
+        # Stop main rest task (which owns the single long-poll connection).
+        if self.rest_task:
+            if not self.rest_task.cancelled():
+                self.rest_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(self.rest_task)
+
+        # Clear callback lists to prevent memory leaks
+        self.data_update_cbs.clear()
+        self.review_event_cbs.clear()
+        self.auth_error_cbs.clear()
+
+        # Reset task references
+        self.rest_task = None
+
+        # Take the lock so a login already in flight finishes first and its
+        # session is the one logged out; later requests see ``_closed``.
+        async with self._login_lock:
+            session_id, self._session_id = self._session_id, None
+            if session_id:
+                await self._logout(session_id)
+
+    async def _monitor_events_request(self, payload: Any) -> Any | None:
+        """Monitor updates from the API."""
+        try:
+            response = await self.request(
+                method="post",
+                data=payload,
+                path="/monitor-updates",
+                api_timeout=aiohttp.ClientTimeout(
+                    total=70
+                ),  # Inception long-poll timeout is 60 seconds, this should be enough
+            )
+        except TimeoutError:
+            # No response from the API, try again later
+            return None
+
+        if not response or "Result" not in response or "ID" not in response:
+            # No response from the API, try again later
+            return None
+
+        return response
+
+    async def _review_events_request(self, query_params: str) -> Any | None:
+        """Get review events from the API."""
+        try:
+            _LOGGER.debug("Request: %s", f"/review?{query_params}")
+            response = await self.request(
+                method="get",
+                path=f"/review?{query_params}",
+                api_timeout=aiohttp.ClientTimeout(
+                    total=10
+                ),  # Standard timeout for GET request
+            )
+        except TimeoutError:
+            # No response from the API, try again later
+            return None
+
+        if not response:
+            # No response from the API, try again later
+            return None
+
+        return response
+
+    async def request(  # noqa: PLR0913
+        self,
+        method: str,
+        path: str,
+        data: Any | None = None,
+        api_timeout: aiohttp.ClientTimeout | None = None,
+        api_prefix: str = "api/v1",
+        *,
+        authenticated: bool = True,
+    ) -> Any:
+        """Get information from the API."""
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        session_id: str | None = None
+        if authenticated and self._token:
+            headers["Authorization"] = f"APIToken {self._token}"
+        elif authenticated:
+            session_id = await self._ensure_session()
+
+        # If path begins with a slash, remove it
+        path = path.removeprefix("/")
+        prefix = api_prefix.strip("/")
+        url = f"{self._host}/{prefix}/{path}"
+
+        try:
+            return await self._send(
+                method,
+                url,
+                headers=headers,
+                cookies=_session_cookie(session_id),
+                data=data,
+                api_timeout=api_timeout,
+            )
+        except InceptionApiClientAuthenticationError:
+            if session_id is None:
+                raise
+
+        # Sessions expire after 10 idle minutes; log in again and retry once
+        # before treating it as bad credentials.
+        session_id = await self._ensure_session(stale=session_id)
+        return await self._send(
+            method,
+            url,
+            headers=headers,
+            cookies=_session_cookie(session_id),
+            data=data,
+            api_timeout=api_timeout,
+        )
+
+    async def _send(  # noqa: PLR0913
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        data: Any | None = None,
+        api_timeout: aiohttp.ClientTimeout | None = None,
+    ) -> Any:
+        """Send one request and return its JSON body, mapping errors to ours."""
+        try:
+            response = await self._session.request(
+                method=method,
+                url=url,
+                headers=headers,
+                cookies=cookies,
+                json=data,
+                timeout=api_timeout or aiohttp.ClientTimeout(total=10),
+            )
+            if response.status == 403:  # noqa: PLR2004
+                msg = "Invalid credentials (forbidden)"
+                raise InceptionApiClientForbiddenError(msg)  # noqa: TRY301
+            if response.status in (401, 403):
+                # Surface 401/403 as a specific auth error so the coordinator
+                # can route it into Home Assistant's re-auth flow rather than
+                # treating it as a transient connection failure.
+                msg = "Invalid credentials"
+                raise InceptionApiClientAuthenticationError(msg)  # noqa: TRY301
+            response.raise_for_status()
+            return await response.json(content_type=None)
+        except InceptionApiClientError:
+            # Our own exception hierarchy must propagate unchanged — the
+            # broad `except Exception` below would otherwise rewrap the
+            # auth error as a generic client error.
+            raise
+        except TimeoutError as exception:
+            _LOGGER.debug("Timeout fetching %s", url)
+            raise TimeoutError from exception
+        except (aiohttp.ClientError, socket.gaierror) as exception:
+            msg = f"Error fetching information - {exception}"
+            _LOGGER.debug(msg)
+            raise InceptionApiClientCommunicationError(
+                msg,
+            ) from exception
+        except Exception as exception:  # pylint: disable=broad-except
+            msg = f"Something really wrong happened! - {exception}"
+            _LOGGER.debug(msg)
+            raise InceptionApiClientError(
+                msg,
+            ) from exception
+
+    async def _control_item(self, item: str, data: Any | None = None) -> None:
+        """Control the switch."""
+        return await self.request(
+            method="post", path=f"/control/{item}/activity", data=data
+        )
+
+    async def control_output(self, output_id: str, data: Any | None = None) -> None:
+        """Send a control payload to an output."""
+        return await self._control_item(item=f"output/{output_id}", data=data)
+
+    async def control_input(self, input_id: str, data: Any | None = None) -> None:
+        """Send a control payload to an input."""
+        return await self._control_item(item=f"input/{input_id}", data=data)
+
+    async def get_attached_readers(self, door_id: str) -> list[dict[str, Any]]:
+        """List readers attached to ``door_id`` via the control endpoint."""
+        response = await self.request(
+            method="get",
+            path=f"/control/door/{door_id}/attached-readers",
+        )
+        if isinstance(response, list):
+            return response
+        return []
+
+    async def _submit_activity(self, payload: dict[str, Any]) -> str | None:
+        """
+        POST ``payload`` to ``/api/v1/activity`` and return the ActivityID.
+
+        Returns ``None`` if the server reports a ``Failure`` result. Network
+        / HTTP errors propagate as the usual ``InceptionApiClientError``
+        subclasses so callers can map them to ``HomeAssistantError``.
+        """
+        response = await self.request(
+            method="post",
+            path="/activity",
+            data=payload,
+        )
+        if not isinstance(response, dict):
+            return None
+        result = response.get("Response", {})
+        if isinstance(result, dict) and result.get("Result") == "Success":
+            activity_id = response.get("ActivityID")
+            if isinstance(activity_id, str):
+                return activity_id
+        message = "Unknown"
+        if isinstance(result, dict):
+            message = str(result.get("Message", message))
+        msg = f"Activity submission failed: {message}"
+        raise InceptionApiClientError(msg)
+
+    async def badge_credential_at_reader(
+        self,
+        reader_id: str,
+        credential_template: str,
+        card_number: str,
+    ) -> str | None:
+        """Virtually badge a credential at a reader. Returns the ActivityID."""
+        return await self._submit_activity(
+            {
+                "Type": "BadgeCredentialAtReader",
+                "CredentialData": {
+                    "CredentialTemplate": credential_template,
+                    "Data": card_number,
+                },
+                "Entity": reader_id,
+            }
+        )
+
+    async def send_pin_to_reader(self, reader_id: str, pin: str) -> str | None:
+        """Virtually present a User PIN at a reader. Returns the ActivityID."""
+        return await self._submit_activity(
+            {
+                "Type": "SendPINDataToReader",
+                "Entity": reader_id,
+                "PINData": pin,
+            }
+        )
+
+    async def get_review_events(  # noqa: PLR0913
+        self,
+        *,
+        limit: int | None = None,
+        offset: int | None = None,
+        direction: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        category_filter: list[str] | None = None,
+        message_type_id_filter: list[int] | None = None,
+        involved_entity_id_filter: list[str] | None = None,
+        reference_id: str | None = None,
+        reference_time: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Query historical review events via `GET /api/v1/review`.
+
+        Any parameter left as `None` is omitted from the query. The Inception
+        controller returns either a wrapped `{"Offset", "Count", "Data": [...]}`
+        envelope or, for some firmware versions, a bare list. Both shapes are
+        normalised to a list of event dicts before returning.
+        """
+        candidates: list[tuple[str, Any]] = [
+            ("limit", limit),
+            ("offset", offset),
+            ("dir", direction),
+            ("start", start),
+            ("end", end),
+            ("referenceId", reference_id),
+            ("referenceTime", reference_time),
+        ]
+        params: dict[str, str] = {
+            key: str(value) for key, value in candidates if value is not None
+        }
+        if category_filter:
+            params["categoryFilter"] = ",".join(category_filter)
+        if message_type_id_filter:
+            params["messageTypeIdFilter"] = ",".join(
+                str(value) for value in message_type_id_filter
+            )
+        if involved_entity_id_filter:
+            params["involvedEntityIdFilter"] = ",".join(involved_entity_id_filter)
+
+        query_params = urlencode(params)
+        response = await self._review_events_request(query_params)
+
+        if response is None:
+            return []
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            data = response.get("Data", [])
+            if isinstance(data, list):
+                return data
+        return []
+
+    async def start_review_listener(self, categories: list[str]) -> None:
+        """
+        Enable bundled review-event polling on the next long-poll iteration.
+
+        No separate task is spawned: the main `_rest_task` long-poll picks
+        up the flag on its next iteration and adds a LiveReviewEvents
+        sub-request to the same HTTP request.
+        """
+        _LOGGER.debug(
+            "Enabling review events listener for categories: %s (was enabled: %s)",
+            categories,
+            self._review_events_enabled,
+        )
+        self._review_events_enabled = True
+        self._review_events_categories = categories[:]
+        _LOGGER.info("Review events listener enabled for categories: %s", categories)
+
+    async def stop_review_listener(self) -> None:
+        """Disable bundled review-event polling from the next iteration."""
+        _LOGGER.debug(
+            "Disabling review events listener (was enabled: %s)",
+            self._review_events_enabled,
+        )
+        self._review_events_enabled = False
+        self._review_events_categories = []
+        _LOGGER.info("Review events listener disabled")
